@@ -1,35 +1,59 @@
-# [Configuration Management] Version 1.2 (2026-01-12)
-# 요구사항: 24시간제(HH:mm), 중복 방지, 공시 우선순위, 상시 루프
-
-import requests
-import time
+import feedparser, requests, time
 from datetime import datetime
 
-# --- [Configuration] ---
-TELEGRAM_TOKEN = "8513001239:AAGWAFFZIlXz-o6f4GzSiMwmfjXlxLFOqzc"
-CHAT_ID = "사용자님의_CHAT_ID" # 텔레그램에서 /id 등을 통해 확인된 ID
+# --- [설정값] ---
+TOKEN = "8513001239:AAGWAFFZIlXz-o6f4GzSiMwmfjXlxLFOqzc"
+CHAT_ID = "8555008565"
+
 WATCH_LIST = ["에이비엘바이오", "HPSP", "ABL바이오"]
-KEYWORDS = ["임상", "IND", "공시", "주주변경", "매도", "FDA", "계약"]
-SENT_NEWS = set() # 중복 전송 방지용 DB
+# [필터링 키워드]
+KEYWORDS = ["공시", "수주", "계약", "계약해지", "테스트결과", "임상결과", "임상", "공급"]
 
-def get_latest_news():
-    # 실제 운영 시에는 뉴스 API 또는 RSS 피드를 호출합니다.
-    # 현재는 사용자님이 주신 '에이비엘바이오(08:12)', 'HPSP(16:30)' 데이터를 기본값으로 처리
-    pass
+SENT_LINKS = set() # 중복 방지
 
-def send_push(title, original_time, content):
-    # [요구사항 반영] 24시간 체제 강제 (HH:mm)
-    formatted_time = original_time 
-    message = f"[{formatted_time}] {title}\n\n{content}"
+def run_stock_intelligence():
+    print(f"\n[점검 시간: {datetime.now().strftime('%H:%M:%S')}] ------------------")
     
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    params = {"chat_id": CHAT_ID, "text": message}
-    requests.post(url, params=params)
+    # 구글 뉴스 RSS (최신 뉴스 20개 내외를 항상 가져옴)
+    rss_url = "https://news.google.com/rss/search?q=에이비엘바이오+OR+HPSP&hl=ko&gl=KR&ceid=KR:ko"
+    feed = feedparser.parse(rss_url)
 
-# --- [Main Loop] ---
-# 백그라운드에서 60초마다 무한 반복하며 뉴스를 체크합니다.
-while True:
-    # 1. 뉴스 크롤링 및 필터링 로직 작동
-    # 2. 신규 뉴스 발견 시 (중복 체크 후)
-    # 3. send_push(뉴스제목, "24시간제_시간", "요약내용") 실행
-    time.sleep(60)
+    for entry in feed.entries:
+        if entry.link not in SENT_LINKS:
+            title = entry.title
+            # 24시간제 시간 추출
+            dt = datetime(*(entry.published_parsed[:6]))
+            time_24h = dt.strftime("%H:%M")
+            
+            # 1. 백그라운드 전체 수집 (종목 관련 모든 뉴스)
+            if any(stock in title for stock in WATCH_LIST):
+                is_urgent = any(k in title for k in KEYWORDS)
+                
+                # 2. 뉴스 게시판 출력 (Replit 콘솔에 기록 보존)
+                # 키워드에 해당하면 알람 아이콘(🚨) 추가
+                icon = "🚨 [PUSH 대상]" if is_urgent else "⚪ [일반 뉴스]"
+                print(f"{icon} [{time_24h}] {title}")
+                
+                # 3. 선별적 Push (키워드 매칭 시에만 텔레그램 발송)
+                if is_urgent:
+                    message = f"🚨 [핵심포착] {title}\n\n시간: [{time_24h}]\n링크: {entry.link}"
+                    try:
+                        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage", 
+                                      data={"chat_id": CHAT_ID, "text": message})
+                    except:
+                        print("!! 텔레그램 발송 오류")
+                
+                SENT_LINKS.add(entry.link)
+
+if __name__ == "__main__":
+    print("=== Stock-Intelligence Work Space 가동 ===")
+    print("필터링 기준: 종목명 + (공시/수주/계약/임상 등)")
+    
+    while True:
+        try:
+            run_stock_intelligence()
+        except Exception as e:
+            print(f"오류 발생: {e}")
+        
+        # 5분(300초)마다 백그라운드 재탐색
+        time.sleep(300)
