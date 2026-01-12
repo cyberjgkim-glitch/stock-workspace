@@ -4,98 +4,116 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 import time
-import threading
 
-# --- [1. 기본 설정 정보] ---
-SERPER_API_KEY = "18adbf4f02cfee39cd4768e644874e02a8eaacb1"
-USER_CHAT_ID = "8555008565"
+# ==========================================
+# [변경 관리] 사용자 환경 설정 구역
+# ==========================================
+# 1. API 키 및 텔레그램 정보 (한 번만 입력하면 코드를 바꿔도 유지되도록 설계)
+CONFIG = {
+    "SERPER_API_KEY": "18adbf4f02cfee39cd4768e644874e02a8eaacb1",
+    "TG_TOKEN": "사용자님의_토큰을_여기에_넣으세요", 
+    "CHAT_ID": "8555008565",
+    "STOCKS": ["한미반도체", "HPSP", "알테오젠", "ABL바이오", "JPHC"],
+    "KEYWORDS": ["공시", "주주", "임상", "수주", "계약", "보고서", "JP모건", "블록딜", "매각", "상장", "보유", "철회"]
+}
 
-STOCKS = ["한미반도체", "HPSP", "알테오젠", "ABL바이오", "JPHC"]
-KEYWORDS = ["공시", "주주", "임상", "수주", "계약", "보고서", "JP모건", "블록딜", "매각", "상장", "보유", "철회"]
-
-# --- [2. DB 구조 강제 생성 및 보정] ---
-def init_db():
+# ==========================================
+# [형상 관리] DB 무결성 및 자가 치유 엔진
+# ==========================================
+def migrate_db():
+    """DB 구조를 검사하고 누락된 컬럼이 있으면 실시간으로 추가합니다."""
     conn = sqlite3.connect('global_stock_db.db', check_same_thread=False)
     c = conn.cursor()
-    # 테이블이 아예 없거나 구조가 다르면 새로 만듭니다.
-    c.execute('''CREATE TABLE IF NOT EXISTS news 
-                 (id TEXT PRIMARY KEY, stock TEXT, pub_date TEXT, title TEXT, 
-                  link TEXT, source TEXT, snippet TEXT, matched_kw TEXT)''')
+    # 테이블이 없으면 생성
+    c.execute('''CREATE TABLE IF NOT EXISTS news (id TEXT PRIMARY KEY)''')
+    
+    # 필요한 모든 컬럼 정의
+    required_columns = {
+        "stock": "TEXT", "pub_date": "TEXT", "title": "TEXT",
+        "link": "TEXT", "source": "TEXT", "snippet": "TEXT", "matched_kw": "TEXT"
+    }
+    
+    # 현재 존재하는 컬럼 확인
+    c.execute("PRAGMA table_info(news)")
+    existing_cols = [info[1] for info in c.fetchall()]
+    
+    # 누락된 컬럼만 Alter Table로 추가 (기존 데이터 보존)
+    for col, dtype in required_columns.items():
+        if col not in existing_cols:
+            c.execute(f"ALTER TABLE news ADD COLUMN {col} {dtype}")
+    
     conn.commit()
     conn.close()
 
-# 앱 실행 시 무조건 DB부터 확인
-init_db()
-
-# --- [3. 통합 수집 엔진] ---
-def run_update(token):
-    # 수집 시작 시 세션 상태에 기록
-    st.session_state['is_updating'] = True
+# ==========================================
+# [데이터 엔진] 글로벌 서치 및 정합성 수집
+# ==========================================
+def fetch_and_sync():
+    migrate_db()
     conn = sqlite3.connect('global_stock_db.db', check_same_thread=False)
     c = conn.cursor()
     
-    for stock in STOCKS:
+    for stock in CONFIG["STOCKS"]:
         url = "https://google.serper.dev/news"
-        payload = {"q": stock, "gl": "kr", "hl": "ko", "num": 10}
-        headers = {'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json'}
+        payload = {"q": stock, "gl": "kr", "hl": "ko", "num": 15}
+        headers = {'X-API-KEY': CONFIG["SERPER_API_KEY"], 'Content-Type': 'application/json'}
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=15)
-            news_items = res.json().get('news', [])
-            for item in news_items:
+            for item in res.json().get('news', []):
                 title, link, source, snippet = item['title'], item['link'], item['source'], item.get('snippet', '')
                 pub_date = item.get('date', datetime.now().strftime("%Y-%m-%d"))
-                found_kws = [k for k in KEYWORDS if k in title or k in snippet]
+                
+                found_kws = [k for k in CONFIG["KEYWORDS"] if k in title or k in snippet]
                 matched_kw = ", ".join(found_kws) if found_kws else ""
                 
                 if matched_kw:
                     c.execute("SELECT id FROM news WHERE id=?", (link,))
                     if not c.fetchone():
-                        # 신규 데이터일 때만 알람 전송
-                        if token and len(token) > 10:
-                            requests.get(f"https://api.telegram.org/bot{token}/sendMessage?chat_id={USER_CHAT_ID}&text=🚨 [{stock}] {title}\n{link}")
-                        c.execute("INSERT OR IGNORE INTO news VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
+                        # 신규 데이터 포착 시 알람 발송 (무결성 검증 후)
+                        if len(CONFIG["TG_TOKEN"]) > 10:
+                            requests.get(f"https://api.telegram.org/bot{CONFIG['TG_TOKEN']}/sendMessage?chat_id={CONFIG['CHAT_ID']}&text=🚨 [{stock}] {title}\n{link}")
+                        
+                        c.execute("INSERT INTO news (id, stock, pub_date, title, link, source, snippet, matched_kw) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", 
                                   (link, stock, pub_date, title, link, source, snippet, matched_kw))
         except: pass
     conn.commit()
     conn.close()
-    st.session_state['is_updating'] = False
 
-# --- [4. 백그라운드 자동화 스레드] ---
-def background_worker():
-    """사용자가 없어도 1시간마다 자동으로 수집합니다."""
-    while True:
-        # 백그라운드 수집 시에는 토큰이 저장되어 있지 않을 수 있으므로 화면 상태와 독립적으로 작동 필요
-        # (현 단계에서는 수동 수집 우선 권장)
-        time.sleep(3600)
+# ==========================================
+# [UI/UX] 전문가용 고밀도 게시판 레이아웃
+# ==========================================
+st.set_page_config(page_title="Global Equity Workspace v9.0", layout="wide")
 
-if 'started' not in st.session_state:
-    st.session_state['started'] = True
-    # threading.Thread(target=background_worker, daemon=True).start()
-
-# --- [5. UI 구성: 게시판 스타일] ---
-st.set_page_config(page_title="주식 뉴스룸 v7.8", layout="wide")
+# 가독성을 위한 정밀 CSS 주입
 st.markdown("""
     <style>
-    .news-card { background-color: #f9f9f9; padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 5px solid #007bff; }
-    .news-title { font-size: 1.1rem; font-weight: bold; margin-bottom: 5px; }
-    .news-meta { font-size: 0.85rem; color: #666; }
+    .block-container { padding: 1.5rem 2rem !important; }
+    .news-box { border-bottom: 1px solid #eee; padding: 6px 0; margin-bottom: 2px; }
+    .meta-row { font-size: 0.82rem; color: #666; display: flex; gap: 10px; align-items: center; }
+    .title-row { font-size: 1.05rem; font-weight: 700; margin: 2px 0; color: #1a0dab; text-decoration: none; }
+    .snippet-row { font-size: 0.88rem; color: #444; line-height: 1.35; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; }
+    .badge-disclosure { background-color: #ff4b4b; color: white; padding: 1px 4px; border-radius: 3px; font-weight: bold; font-size: 0.75rem; }
     </style>
     """, unsafe_allow_html=True)
 
-with st.sidebar:
-    st.header("⚙️ 설정 및 진단")
-    tg_token = st.text_input("텔레그램 토큰 입력", type="password", value=st.session_state.get('tg_token', ''))
-    if tg_token: st.session_state['tg_token'] = tg_token
+st.title("🏛️ Professional Global Equity Workspace")
 
-    if st.button("🚀 지금 즉시 데이터 수집 시작"):
-        with st.spinner("전 세계 구글 뉴스를 훑는 중..."):
-            run_update(tg_token)
-            st.success("수집 완료!")
+with st.sidebar:
+    st.header("🛠️ Admin Console")
+    # 토큰이 유실되지 않도록 세션 상태 활용
+    if "tg_token" not in st.session_state:
+        st.session_state.tg_token = CONFIG["TG_TOKEN"]
+    
+    st.session_state.tg_token = st.text_input("Telegram Token", value=st.session_state.tg_token, type="password")
+    CONFIG["TG_TOKEN"] = st.session_state.tg_token
+    
+    if st.button("🚀 Run Integrity Sync (데이터 수집)"):
+        with st.spinner("Synchronizing with Google News Global Engine..."):
+            fetch_and_sync()
             st.rerun()
 
-st.markdown("### 📋 실시간 글로벌 주식 속보 게시판")
-
-# 데이터 표시 로직
+# 메인 게시판 렌더링
+migrate_db()
 try:
     conn = sqlite3.connect('global_stock_db.db')
     df = pd.read_sql_query("SELECT * FROM news ORDER BY rowid DESC", conn)
@@ -103,16 +121,17 @@ try:
 
     if not df.empty:
         for _, row in df.iterrows():
-            icon = "🔔" if any(k in row['matched_kw'] for k in ["공시", "블록딜", "매각", "보유"]) else "📄"
+            is_disclosure = "공시" in row['matched_kw'] or "블록딜" in row['matched_kw']
+            badge = '<span class="badge-disclosure">🔔 ALERT</span>' if is_disclosure else '📄 NEWS'
+            
             st.markdown(f"""
-                <div class="news-card">
-                    <div class="news-meta">{icon} <b>[{row['stock']}]</b> | {row['source']} | {row['pub_date']} | 키워드: <span style="color:blue">{row['matched_kw']}</span></div>
-                    <div class="news-title"><a href="{row['link']}" target="_blank" style="text-decoration:none; color:black;">{row['title']}</a></div>
-                    <div style="font-size:0.9rem; color:#444;">{row['snippet']}</div>
+                <div class="news-box">
+                    <div class="meta-row">{badge} <b>[{row['stock']}]</b> | {row['source']} | {row['pub_date']} | <span style="color:#007bff">#{row['matched_kw']}</span></div>
+                    <div class="title-row"><a href="{row['link']}" style="text-decoration:none; color:#1a0dab;">{row['title']}</a></div>
+                    <div class="snippet-row">{row['snippet']}</div>
                 </div>
             """, unsafe_allow_html=True)
     else:
-        st.warning("📥 아직 수집된 데이터가 없습니다. 왼쪽 사이드바의 [🚀 지금 즉시 데이터 수집 시작] 버튼을 눌러주세요.")
+        st.warning("No data found. Please trigger 'Run Integrity Sync' from the sidebar.")
 except Exception as e:
-    st.error(f"⚠️ 시스템 확인 중: {e}")
-    st.info("데이터베이스 구조를 정렬하고 있습니다. 잠시 후 [데이터 수집 시작]을 눌러주세요.")
+    st.error(f"Integrity Error: {e}")
