@@ -5,131 +5,171 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import threading
+import re
 
 # ==========================================
-# [Configuration] 전역 설정 및 형상 관리
+# [Configuration] 형상 및 환경 변수 관리
 # ==========================================
-VERSION = "15.0"
+VERSION = "16.0"
 SERPER_KEY = "18adbf4f02cfee39cd4768e644874e02a8eaacb1"
-# [source 26] 제공해주신 토큰 반영
+# [source 26] 제공해주신 토큰 및 ID 고정
 TG_TOKEN = "8513001239:AAGWAFFZILxz-o6f4GzSiMwmFjXLxLF0qzc"
 CHAT_ID = "8555008565"
 
-STOCKS = ["한미반도체", "HPSP", "알테오젠", "ABL바이오", "JPHC"]
-# [source 11, 17] 긴급 항목 정의
-ALERT_KEYWORDS = ["공시", "수주", "계약", "계약해지", "주주", "변동", "유상증자", "테스트", "임상"]
+# [source 16] 초기 종목 설정
+DEFAULT_STOCKS = ["한미반도체", "HPSP", "알테오젠", "ABL바이오", "JPHC"]
+# [source 11, 17] 긴급 뉴스 구분 키워드
+ALERT_KEYWORDS = ["공시", "수주", "계약", "계약해지", "주주 변동", "유상증자", "테스트", "임상"]
 
 # ==========================================
-# [DB Manager] 데이터 보존 및 무결성 관리
+# [Date Parser] 원천 뉴스 일시 정규화 (MM-DD-HH)
 # ==========================================
-def init_db():
-    conn = sqlite3.connect('stock_enterprise_v15.db', check_same_thread=False)
+def parse_source_date(date_str):
+    """[source 19] 상대 시간을 MM-DD-HH 형식의 절대 시간으로 변환"""
+    now = datetime.now()
+    try:
+        if not date_str or date_str == "None":
+            return now.strftime("%m-%d-%H"), int(now.timestamp())
+        
+        # 'N시간 전', 'N일 전' 등 파싱
+        nums = re.findall(r'\d+', date_str)
+        if not nums: return now.strftime("%m-%d-%H"), int(now.timestamp())
+        
+        val = int(nums[0])
+        if '시간' in date_str:
+            target_dt = now - timedelta(hours=val)
+        elif '일' in date_str:
+            target_dt = now - timedelta(days=val)
+        elif '분' in date_str:
+            target_dt = now - timedelta(minutes=val)
+        else:
+            target_dt = now
+            
+        return target_dt.strftime("%m-%d-%H"), int(target_dt.timestamp())
+    except:
+        return now.strftime("%m-%d-%H"), int(now.timestamp())
+
+# ==========================================
+# [DB Manager] 10일 보존 및 무결성 관리
+# ==========================================
+def manage_db(action="init"):
+    conn = sqlite3.connect('stock_master_v16.db', check_same_thread=False)
     c = conn.cursor()
-    # [source 13-21] 요구사항에 맞춘 스키마
-    c.execute('''CREATE TABLE IF NOT EXISTS news 
-                 (id TEXT PRIMARY KEY, stock TEXT, category TEXT, pub_date TEXT, 
-                  pub_ts INTEGER, title TEXT, link TEXT, source TEXT, is_alert INTEGER)''')
-    # [source 23] 10일 경과 데이터 삭제
-    ten_days_ago = (datetime.now() - timedelta(days=10)).timestamp()
-    c.execute("DELETE FROM news WHERE pub_ts < ?", (ten_days_ago,))
+    if action == "init":
+        # [source 8, 13-21] 스키마 정의
+        c.execute('''CREATE TABLE IF NOT EXISTS news 
+                     (id TEXT PRIMARY KEY, stock TEXT, category TEXT, pub_date TEXT, 
+                      pub_ts INTEGER, title TEXT, link TEXT, source TEXT, is_alert INTEGER)''')
+        # [source 23] 10일 경과 데이터 삭제
+        limit_ts = int((datetime.now() - timedelta(days=10)).timestamp())
+        c.execute("DELETE FROM news WHERE pub_ts < ?", (limit_ts,))
     conn.commit()
     conn.close()
 
 # ==========================================
-# [Data Engine] 탐색 및 스케줄링 로직
+# [Core Engine] 24시간 탐색 및 Push 모듈
 # ==========================================
-def fetch_news():
-    init_db()
-    conn = sqlite3.connect('stock_enterprise_v15.db', check_same_thread=False)
+def fetch_and_process():
+    manage_db("init")
+    conn = sqlite3.connect('stock_master_v16.db', check_same_thread=False)
     c = conn.cursor()
     
-    for s in STOCKS:
-        url = "https://google.serper.dev/news"
+    # 세션에서 종목 리스트 가져오기 [source 15]
+    stocks = st.session_state.get('target_stocks', DEFAULT_STOCKS)
+    
+    for s in stocks:
         headers = {'X-API-KEY': SERPER_KEY, 'Content-Type': 'application/json'}
         try:
-            res = requests.post(url, headers=headers, json={"q": s, "gl": "kr", "hl": "ko", "num": 10}, timeout=10)
+            res = requests.post("https://google.serper.dev/news", 
+                                headers=headers, 
+                                json={"q": s, "gl": "kr", "hl": "ko", "num": 10}, timeout=10)
             items = res.json().get('news', [])
             for i in items:
                 title, link, source = i['title'], i['link'], i['source']
-                # [source 19] 일시 형식 MM-DD-HH
-                dt = datetime.now()
-                pub_date = dt.strftime("%m-%d-%H")
-                pub_ts = int(dt.timestamp())
+                display_date, timestamp = parse_source_date(i.get('date'))
                 
-                # [source 11] 긴급 항목 판단
-                is_alert = 1 if any(kw in title for kw in ALERT_KEYWORDS) else 0
-                category = "공시/긴급" if is_alert else "일반뉴스"
+                # [source 11, 17] 카테고리 분류 및 알람 여부
+                found_kws = [kw for kw in ALERT_KEYWORDS if kw in title]
+                is_alert = 1 if found_kws else 0
+                category = ", ".join(found_kws) if is_alert else "일반뉴스"
                 
                 c.execute("SELECT id FROM news WHERE id=?", (link,))
                 if not c.fetchone():
-                    # [source 25, 27] Push Service
+                    # [source 25, 27] 신규 긴급 데이터 Push
                     if is_alert:
-                        msg = f"🚨 [{s}] {title}\n{link}"
+                        msg = f"🔔 [긴급] {s} | {category}\n제목: {title}\n링크: {link}"
                         requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage?chat_id={CHAT_ID}&text={msg}")
                     
                     c.execute("INSERT INTO news VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", 
-                              (link, s, category, pub_date, pub_ts, title, link, source, is_alert))
+                              (link, s, category, display_date, timestamp, title, link, source, is_alert))
         except: pass
     conn.commit()
     conn.close()
 
-# [source 9] 스케줄링 스레드
-def scheduler():
+# [source 9] 스케줄링 엔진
+def run_scheduler():
     while True:
         now = datetime.now()
-        fetch_news()
-        # 07:30~10:30은 30분, 그 외 1시간
-        interval = 1800 if 7.5 <= (now.hour + now.minute/60) <= 10.5 else 3600
-        time.sleep(interval)
+        fetch_and_process()
+        # 07:30~10:30(30분), 이외 1시간
+        if 7.5 <= (now.hour + now.minute/60) <= 10.5:
+            time.sleep(1800)
+        else:
+            time.sleep(3600)
 
-if 'sched' not in st.session_state:
-    threading.Thread(target=scheduler, daemon=True).start()
-    st.session_state['sched'] = True
+if 'init' not in st.session_state:
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    st.session_state['init'] = True
+    st.session_state['target_stocks'] = DEFAULT_STOCKS
 
 # ==========================================
-# [UI Engine] 고밀도 게시판 레이아웃
+# [Presentation] 요구사항 준수 게시판 (UI)
 # ==========================================
-st.set_page_config(page_title=f"Enterprise Stock Room v{VERSION}", layout="wide")
+st.set_page_config(page_title="Stock Intelligence v16.0", layout="wide")
 
-# [source 18, 30] 가독성 고정 CSS
+# [source 18, 30] 간격 최적화 CSS
 st.markdown("""
     <style>
-    .block-container {padding: 1rem !important;}
-    .n-row {border-bottom: 1px solid #eee; padding: 3px 0; margin-bottom: 2px;}
-    .n-line1 {font-size: 0.75rem; color: #666; margin-bottom: 1px;}
-    .n-line2 {font-size: 0.95rem; font-weight: 700; line-height: 1.2;}
-    .n-link {text-decoration: none; color: #1a0dab;}
-    .alert-icon {color: #ff4b4b; font-weight: bold;}
-    hr {margin: 4px 0 !important;}
+    .block-container {padding: 1.5rem !important;}
+    .n-row {border-bottom: 1px solid #eee; padding: 5px 0; margin-bottom: 2px;}
+    .n-line1 {font-size: 0.8rem; color: #555; margin-bottom: 2px;}
+    .n-line2 {font-size: 1.0rem; font-weight: 700; line-height: 1.3;}
+    .alert-bell {color: #ff4b4b; font-size: 0.9rem;}
+    hr {margin: 5px 0 !important;}
     </style>
     """, unsafe_allow_html=True)
 
-st.title(f"📊 실시간 주식 뉴스 게시판 v{VERSION}")
+st.title("📈 주식 뉴스/공시 통합 게시판")
 
 with st.sidebar:
-    st.header("Project Management")
-    st.info(f"Version: {VERSION}\nStatus: Monitoring...")
-    if st.button("🚀 즉시 탐색 실행"):
-        fetch_news()
+    st.header("📋 프로젝트 관리")
+    st.info(f"Version: {VERSION}\n상태: 정상 작동 중")
+    # [source 15] 종목 관리
+    new_stock = st.text_input("종목 추가")
+    if st.button("추가"):
+        st.session_state.target_stocks.append(new_stock)
+        st.rerun()
+    if st.button("🚀 강제 동기화 (Test)"):
+        fetch_and_process()
         st.rerun()
 
-# [source 21] 최신순 정렬
+# [source 21] 최신순 정렬 출력
 try:
-    conn = sqlite3.connect('stock_enterprise_v15.db')
+    conn = sqlite3.connect('stock_master_v16.db')
     df = pd.read_sql_query("SELECT * FROM news ORDER BY pub_ts DESC", conn)
     conn.close()
 
     if not df.empty:
         for _, r in df.iterrows():
-            # [source 14] 2행 구성 출력
-            alert_prefix = "<span class='alert-icon'>🔔</span> " if r['is_alert'] else ""
+            # [source 13, 14, 18] 2행 게시판 레이아웃
+            bell = "<span class='alert-bell'>🔔</span> " if r['is_alert'] else ""
             st.markdown(f"""
                 <div class="n-row">
-                    <div class="n-line1">{alert_prefix}<b>{r['stock']}</b> | {r['category']} | {r['pub_date']} | {r['source']}</div>
-                    <div class="n-line2"><a href="{r['link']}" target="_blank" class="n-link">{r['title']}</a></div>
+                    <div class="n-line1">{bell}<b>{r['stock']}</b> | {r['category']} | {r['pub_date']} | {r['source']}</div>
+                    <div class="n-line2"><a href="{r['link']}" target="_blank" style="text-decoration:none; color:#1a0dab;">{r['title']}</a></div>
                 </div>
             """, unsafe_allow_html=True)
     else:
-        st.info("데이터를 수집 중입니다. 잠시만 기다려주시거나 [즉시 탐색]을 눌러주세요.")
+        st.warning("데이터 수집 중입니다. [강제 동기화]를 눌러 테스트하십시오.")
 except:
-    st.warning("데이터베이스 연결 대기 중...")
+    st.info("DB 연결 준비 중...")
